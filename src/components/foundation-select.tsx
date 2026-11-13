@@ -59,30 +59,41 @@ export function FoundationSelect({
 
   const syncPosition = () => {
     const button = buttonRef.current
-    if (!button) return
+    const menu = menuRef.current
+    if (!button || !menu) return
 
     const rect = button.getBoundingClientRect()
     const viewportGap = 12
+    const triggerGap = 8
     const width = Math.min(Math.max(rect.width, 260), window.innerWidth - viewportGap * 2)
-    const estimatedHeight = Math.min(enableSearch ? 390 : 330, window.innerHeight - viewportGap * 2)
-    const top = rect.bottom + 8 + estimatedHeight > window.innerHeight
-      ? Math.max(viewportGap, rect.top - estimatedHeight - 8)
-      : rect.bottom + 8
+    // Measure at the final width, without a previous placement's height limit.
+    const previousWidth = menu.style.width
+    const previousMaxHeight = menu.style.maxHeight
+    menu.style.width = `${width}px`
+    menu.style.maxHeight = "none"
+    const menuHeight = Math.min(menu.getBoundingClientRect().height, enableSearch ? 390 : 330)
+    menu.style.width = previousWidth
+    menu.style.maxHeight = previousMaxHeight
+    const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - triggerGap - viewportGap)
+    const spaceAbove = Math.max(0, rect.top - triggerGap - viewportGap)
+    const openAbove = menuHeight > spaceBelow && spaceAbove > spaceBelow
     const left = Math.min(window.innerWidth - width - viewportGap, Math.max(viewportGap, rect.left))
 
     setPosition({
       position: "fixed",
-      top,
+      // Anchor the near edge to the trigger; short menus must not float away.
+      top: openAbove ? undefined : rect.bottom + triggerGap,
+      bottom: openAbove ? window.innerHeight - rect.top + triggerGap : undefined,
       left,
       width,
-      maxHeight: Math.min(estimatedHeight, window.innerHeight - top - viewportGap),
+      maxHeight: Math.min(enableSearch ? 390 : 330, openAbove ? spaceAbove : spaceBelow),
     })
   }
 
   useLayoutEffect(() => {
     if (!open) return
     syncPosition()
-  }, [open, value, options.length])
+  }, [open, value, options.length, query, enableSearch])
 
   useEffect(() => {
     if (!open) return

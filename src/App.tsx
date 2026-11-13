@@ -5572,7 +5572,8 @@ function getCode128Segments(value: string) {
   const codes = [104, ...safeValue.split("").map((character) => character.charCodeAt(0) - 32)]
   const checksum = codes.reduce((total, code, index) => total + (index === 0 ? code : code * index), 0) % 103
   const sequence = [...codes, checksum, 106]
-  let x = 0
+  const quietZone = 10
+  let x = quietZone
   const bars: Array<{ x: number; width: number }> = []
 
   sequence.forEach((code) => {
@@ -5584,19 +5585,7 @@ function getCode128Segments(value: string) {
     })
   })
 
-  return { bars, width: x, value: safeValue }
-}
-
-function Code128Barcode({ value, className = "" }: { value: string; className?: string }) {
-  const barcode = getCode128Segments(value || "DMS")
-  return (
-    <svg className={className} viewBox={`0 0 ${barcode.width} 48`} role="img" aria-label={`Barcode ${barcode.value}`} preserveAspectRatio="none">
-      <rect width={barcode.width} height="48" fill="#ffffff" />
-      {barcode.bars.map((bar, index) => (
-        <rect key={`${bar.x}-${index}`} x={bar.x} y="0" width={bar.width} height="48" fill="#071332" />
-      ))}
-    </svg>
-  )
+  return { bars, width: x + quietZone, value: safeValue }
 }
 
 function escapeSvgText(value: string) {
@@ -5659,13 +5648,253 @@ function getIdCardNameLines(value: string) {
 }
 
 function downloadTextFile(filename: string, content: string, mimeType: string) {
-  const blob = new Blob([content], { type: mimeType })
+  downloadBlobFile(filename, new Blob([content], { type: mimeType }))
+}
+
+function downloadBlobFile(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement("a")
   anchor.href = url
   anchor.download = filename
+  document.body.appendChild(anchor)
   anchor.click()
-  URL.revokeObjectURL(url)
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
+}
+
+function escapeSvgAttribute(value: string) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&apos;")
+}
+
+async function getImageDataUri(imageUrl: string) {
+  if (!imageUrl) return ""
+
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 15_000)
+  try {
+    const response = await fetch(imageUrl, { signal: controller.signal })
+    if (!response.ok) throw new Error("Gagal mengambil gambar.")
+
+    const imageBlob = await response.blob()
+    if (!imageBlob.type.startsWith("image/")) throw new Error("Format gambar tidak valid.")
+
+    const dataUri = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.addEventListener("load", () => resolve(typeof reader.result === "string" ? reader.result : ""), { once: true })
+      reader.addEventListener("error", () => reject(reader.error), { once: true })
+      reader.readAsDataURL(imageBlob)
+    })
+    await loadEmployeeIdCardImage(dataUri)
+    return dataUri
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
+
+function createEmployeeIdCardSvg(
+  row: EmployeeDirectoryRow,
+  barcodeValue: string,
+  photoDataUri = "",
+  logoDataUri = "",
+  size: EmployeeIdCardPrintSize = "standard",
+) {
+  const dimensions = employeeIdCardPrintSizes[size]
+  const canvasHeight = 550 * dimensions.height / dimensions.width
+  const barcode = getCode128Segments(barcodeValue)
+  const barSvg = barcode.bars.map((bar) => `<rect x="${bar.x}" y="0" width="${bar.width}" height="52" fill="#071332"/>`).join("")
+  const displayName = formatIdCardDisplayText(row.fullName || row.employeeCode)
+  const displayPosition = formatIdCardDisplayText(row.positionName || "-")
+  const displayDivision = formatIdCardDisplayText(row.divisionName || "-")
+  const nameLines = getIdCardNameLines(displayName)
+  const svgNameLines = nameLines
+    .map((line, index) => `<text x="275" y="${nameLines.length === 1 ? 385 : 364 + index * 31}" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${nameLines.length === 1 ? 31 : 27}" font-weight="900" fill="#071332">${escapeSvgText(line)}</text>`)
+    .join("")
+  const positionLabel = truncateIdCardText(displayPosition, 27)
+  const divisionLabel = truncateIdCardText(displayDivision, 30)
+  const svgInitials = escapeSvgText(getProfileInitials(row.fullName || row.employeeCode))
+  const svgEmployeeCode = escapeSvgText(truncateIdCardText(row.employeeCode, 18))
+  const svgBarcodeValue = escapeSvgText(truncateIdCardText(barcodeValue, 42))
+  const avatarSvg = photoDataUri
+    ? `<defs><clipPath id="employee-avatar-clip"><rect x="201" y="129" width="148" height="171" rx="23"/></clipPath></defs>
+  <rect x="198" y="126" width="154" height="177" rx="26" fill="#ffffff"/>
+  <image href="${escapeSvgAttribute(photoDataUri)}" x="201" y="129" width="148" height="171" preserveAspectRatio="xMidYMid slice" clip-path="url(#employee-avatar-clip)"/>`
+    : `<rect x="198" y="126" width="154" height="177" rx="26" fill="#eef7fb" stroke="#ffffff" stroke-width="6"/>
+  <text x="275" y="232" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="52" font-weight="900" fill="#071332">${svgInitials}</text>`
+  const logoSvg = logoDataUri
+    ? `<image href="${escapeSvgAttribute(logoDataUri)}" x="39" y="39" width="42" height="42" preserveAspectRatio="xMidYMid meet"/>`
+    : `<text x="60" y="71" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="900" fill="#071332">DMS</text>`
+
+  return `
+<svg xmlns="http://www.w3.org/2000/svg" width="${dimensions.width}mm" height="${dimensions.height}mm" viewBox="0 0 550 ${canvasHeight}">
+  <defs><clipPath id="employee-card-clip"><rect x="1" y="1" width="548" height="${canvasHeight - 2}" rx="26"/></clipPath></defs>
+  <rect x="1" y="1" width="548" height="${canvasHeight - 2}" rx="26" fill="#ffffff" stroke="#d8e2ec" stroke-width="2"/>
+  <g clip-path="url(#employee-card-clip)">
+    <rect width="550" height="142" fill="#071332"/>
+  </g>
+  <rect x="29" y="29" width="62" height="62" rx="13" fill="#ffffff"/>
+  ${logoSvg}
+  <text x="107" y="55" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="900" fill="#bdefff">DMS</text>
+  <text x="107" y="84" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="900" fill="#ffffff">Employee ID</text>
+  <text x="520" y="61" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="900" fill="#bdefff">OFFICIAL</text>
+  ${avatarSvg}
+  <text x="275" y="340" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="900" fill="#0085a0">${svgEmployeeCode}</text>
+  ${svgNameLines}
+  <text x="275" y="432" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="900" fill="#172033">${escapeSvgText(positionLabel)}</text>
+  <line x1="29" y1="478" x2="521" y2="478" stroke="#d8e2ec" stroke-width="2"/>
+  <text x="275" y="527" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="900" fill="#697891">DIVISI</text>
+  <text x="275" y="556" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="900" fill="#071332">${escapeSvgText(divisionLabel)}</text>
+  <rect x="29" y="627" width="492" height="87" fill="#ffffff"/>
+  <svg x="30" y="629" width="490" height="83" viewBox="0 0 ${barcode.width} 52" preserveAspectRatio="none">
+    <rect width="${barcode.width}" height="52" fill="#ffffff"/>
+    ${barSvg}
+  </svg>
+  <text x="275" y="755" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="900" fill="#071332">${svgBarcodeValue}</text>
+  <text x="275" y="797" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="900" fill="#697891">PROPERTY OF DMS</text>
+</svg>`.trim()
+}
+
+function getSvgDataUri(svg: string) {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
+async function createEmployeeIdCardArtwork(row: EmployeeDirectoryRow, barcodeValue: string, size: EmployeeIdCardPrintSize) {
+  const [photoDataUri, logoDataUri] = await Promise.all([
+    getImageDataUri(row.photoUrl).catch(() => { throw new Error("Foto karyawan gagal dimuat. Periksa koneksi lalu coba lagi.") }),
+    getImageDataUri(dmsLogo).catch(() => { throw new Error("Logo DMS gagal dimuat. Coba lagi.") }),
+  ])
+  const svg = createEmployeeIdCardSvg(row, barcodeValue, photoDataUri, logoDataUri, size)
+  await loadEmployeeIdCardImage(getSvgDataUri(svg))
+  return svg
+}
+
+function loadEmployeeIdCardImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    const timer = window.setTimeout(() => {
+      image.onload = null
+      image.onerror = null
+      reject(new Error("Gambar ID Card terlalu lama dimuat. Coba lagi."))
+    }, 15_000)
+    image.onload = () => {
+      window.clearTimeout(timer)
+      if (image.naturalWidth > 0) resolve(image)
+      else reject(new Error("Gambar ID Card tidak valid."))
+    }
+    image.onerror = () => {
+      window.clearTimeout(timer)
+      reject(new Error("Gagal memuat gambar ID Card. Coba lagi."))
+    }
+    image.src = src
+  })
+}
+
+async function createEmployeeIdCardPng(svg: string, size: EmployeeIdCardPrintSize) {
+  const svgUrl = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }))
+
+  try {
+    const image = await loadEmployeeIdCardImage(svgUrl)
+    const canvas = document.createElement("canvas")
+    canvas.width = 1100
+    canvas.height = Math.round(1100 * employeeIdCardPrintSizes[size].height / employeeIdCardPrintSizes[size].width)
+    const context = canvas.getContext("2d")
+    if (!context) throw new Error("Canvas tidak tersedia di browser ini.")
+
+    context.fillStyle = "#ffffff"
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+
+    return await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob)
+        else reject(new Error("Gagal membuat file PNG ID Card."))
+      }, "image/png")
+    })
+  } finally {
+    URL.revokeObjectURL(svgUrl)
+  }
+}
+
+type EmployeeIdCardPrintSize = "standard" | "pvc"
+type EmployeeIdCardPrintPosition = "top-left" | "center" | "top-right"
+
+const employeeIdCardPrintSizes: Record<EmployeeIdCardPrintSize, { width: number; height: number }> = {
+  standard: { width: 55, height: 85 },
+  pvc: { width: 54, height: 86 },
+}
+
+async function printEmployeeIdCard(
+  idCardSvg: string,
+  size: EmployeeIdCardPrintSize,
+  position: EmployeeIdCardPrintPosition,
+) {
+  const printWindow = window.open("", "_blank", "width=440,height=760")
+  if (!printWindow) {
+    throw new Error("Jendela cetak diblokir browser. Izinkan pop-up untuk DMS lalu coba lagi.")
+  }
+
+  const cardSize = employeeIdCardPrintSizes[size]
+  const imageSource = getSvgDataUri(idCardSvg)
+  const idCardImage = `<img class="idCardPrintImage" src="${escapeSvgAttribute(imageSource)}" alt="ID Card Karyawan" />`
+  const pageContent = `<main class="idCardPrintSheet position-${position}"><div class="idCardPrintSlot">${idCardImage}</div></main>`
+
+  printWindow.document.write(`<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <title>ID Card Karyawan</title>
+    <style>
+      @page { size: A4 portrait; margin: 0; }
+      * { box-sizing: border-box; }
+      html, body { width: 210mm; margin: 0; padding: 0; background: #fff; }
+      .idCardPrintSheet {
+        display: flex;
+        width: 210mm;
+        height: 297mm;
+        padding: 12mm;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+      .idCardPrintSheet.position-top-left { align-items: flex-start; justify-content: flex-start; }
+      .idCardPrintSheet.position-center {
+        align-items: center;
+        justify-content: center;
+      }
+      .idCardPrintSheet.position-top-right { align-items: flex-start; justify-content: flex-end; }
+      .idCardPrintSlot {
+        width: ${cardSize.width}mm;
+        height: ${cardSize.height}mm;
+        overflow: hidden;
+      }
+      .idCardPrintImage { display: block; width: 100%; height: 100%; }
+    </style>
+  </head>
+  <body>${pageContent}</body>
+</html>`)
+  printWindow.document.close()
+
+  await Promise.all(Array.from(printWindow.document.images).map((image) => new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error("Gambar cetak terlalu lama dimuat. Tutup jendela cetak lalu coba lagi.")), 15_000)
+    const finish = () => {
+      window.clearTimeout(timer)
+      if (image.naturalWidth > 0) resolve()
+      else reject(new Error("Gambar cetak gagal dimuat. Tutup jendela cetak lalu coba lagi."))
+    }
+    if (image.complete) {
+      finish()
+      return
+    }
+    image.addEventListener("load", finish, { once: true })
+    image.addEventListener("error", finish, { once: true })
+  })))
+
+  if (printWindow.closed) throw new Error("Jendela cetak sudah ditutup. Klik cetak untuk mencoba lagi.")
+  printWindow.focus()
+  printWindow.print()
 }
 
 function normalizeIntegerInput(value: string, maxValue?: number) {
@@ -15041,7 +15270,6 @@ function EmployeeDetailDialog({
         </div>
 
         <div className="masterDetailActions">
-          <button className="secondaryButton" type="button" onClick={onClose}>Tutup</button>
           {ENABLE_EMPLOYEE_ID_CARD_FLOW && (
             <button className="secondaryButton" type="button" onClick={() => onNametag(row)}>
               <Printer size={16} />
@@ -15213,50 +15441,51 @@ function EmployeeContractExtensionDialog({
 }
 
 function EmployeeNametagDialog({ row, onClose }: { row: EmployeeDirectoryRow | null; onClose: () => void }) {
+  const [exportAction, setExportAction] = useState<"svg" | "png" | "print" | null>(null)
+  const [printSize, setPrintSize] = useState<EmployeeIdCardPrintSize>("standard")
+  const [printPosition, setPrintPosition] = useState<EmployeeIdCardPrintPosition>("center")
+  const [artwork, setArtwork] = useState<{ key: string; svg: string } | null>(null)
+  const [artworkError, setArtworkError] = useState("")
+  const [exportError, setExportError] = useState("")
+  const [retry, setRetry] = useState(0)
+  const barcodeValue = useMemo(
+    () => row ? row.qrToken || generateEmployeeQrToken(row.employeeCode) : "",
+    [row?.id, row?.qrToken, row?.employeeCode],
+  )
+  const artworkKey = JSON.stringify([row?.id, row?.fullName, row?.employeeCode, row?.positionName, row?.divisionName, row?.photoUrl, barcodeValue, printSize])
+  useEffect(() => {
+    let active = true
+    setArtworkError("")
+    setExportError("")
+    setArtwork(null)
+    if (row) {
+      void createEmployeeIdCardArtwork(row, barcodeValue, printSize).then((svg) => {
+        if (active) setArtwork({ key: artworkKey, svg })
+      }).catch((error) => {
+        if (active) setArtworkError(error instanceof Error ? error.message : "Gagal menyiapkan ID Card.")
+      })
+    }
+    return () => { active = false }
+  }, [artworkKey, retry])
   if (!row) return null
 
-  const barcodeValue = row.qrToken || generateEmployeeQrToken(row.employeeCode)
+  const readyArtwork = artwork?.key === artworkKey ? artwork.svg : ""
   const safeFileName = `${row.employeeCode || "employee"}-id-card`.toLowerCase().replace(/[^a-z0-9_-]/g, "-")
-  const barcode = getCode128Segments(barcodeValue)
-  const barSvg = barcode.bars.map((bar) => `<rect x="${bar.x}" y="0" width="${bar.width}" height="52" fill="#071332"/>`).join("")
-  const displayName = formatIdCardDisplayText(row.fullName || row.employeeCode)
-  const displayPosition = formatIdCardDisplayText(row.positionName || "-")
-  const displayDivision = formatIdCardDisplayText(row.divisionName || "-")
-  const nameLines = getIdCardNameLines(displayName)
-  const svgNameLines = nameLines
-    .map((line, index) => `<text x="270" y="${nameLines.length === 1 ? 386 : 366 + index * 32}" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${nameLines.length === 1 ? 31 : 27}" font-weight="800" fill="#071332">${escapeSvgText(line)}</text>`)
-    .join("")
-  const positionLabel = truncateIdCardText(displayPosition, 27)
-  const divisionLabel = truncateIdCardText(displayDivision, 30)
-  const svgInitials = escapeSvgText(getProfileInitials(row.fullName || row.employeeCode))
-  const svgEmployeeCode = escapeSvgText(truncateIdCardText(row.employeeCode, 18))
-  const svgBarcodeValue = escapeSvgText(truncateIdCardText(barcodeValue, 42))
-  const nametagSvg = `
-<svg xmlns="http://www.w3.org/2000/svg" width="540" height="856" viewBox="0 0 540 856">
-  <rect width="540" height="856" rx="22" fill="#ffffff"/>
-  <rect x="24" y="24" width="492" height="808" rx="16" fill="#ffffff" stroke="#d8e2ec" stroke-width="2"/>
-  <path d="M40 24h460a16 16 0 0 1 16 16v94H24V40a16 16 0 0 1 16-16Z" fill="#071332"/>
-  <text x="54" y="72" font-family="Arial, Helvetica, sans-serif" font-size="31" font-weight="900" fill="#ffffff">DMS</text>
-  <text x="54" y="101" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#bdefff">EMPLOYEE ID</text>
-  <text x="486" y="80" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="800" fill="#ffffff">OFFICIAL</text>
-  <text x="486" y="103" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700" fill="#9fb2c9">DMS ID CARD</text>
-  <circle cx="270" cy="240" r="82" fill="#f8fbff" stroke="#22aeca" stroke-width="4"/>
-  <circle cx="270" cy="240" r="70" fill="#eafaff"/>
-  <text x="270" y="262" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="52" font-weight="900" fill="#071332">${svgInitials}</text>
-  <text x="270" y="344" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="800" fill="#0085a0">${svgEmployeeCode}</text>
-  ${svgNameLines}
-  <text x="270" y="440" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="800" fill="#0085a0">${escapeSvgText(positionLabel)}</text>
-  <line x1="70" y1="476" x2="470" y2="476" stroke="#d8e2ec" stroke-width="2"/>
-  <text x="270" y="526" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="800" fill="#697891">DIVISI</text>
-  <text x="270" y="556" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#071332">${escapeSvgText(divisionLabel)}</text>
-  <rect x="62" y="600" width="416" height="82" rx="4" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
-  <svg x="78" y="616" width="384" height="46" viewBox="0 0 ${barcode.width} 52" preserveAspectRatio="none">
-    <rect width="${barcode.width}" height="52" fill="#ffffff"/>
-    ${barSvg}
-  </svg>
-  <text x="270" y="716" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="800" fill="#071332">${svgBarcodeValue}</text>
-  <text x="270" y="756" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" fill="#697891">PROPERTY OF DMS</text>
-</svg>`.trim()
+  const runExport = async (
+    action: "svg" | "png" | "print",
+    task: () => Promise<void>,
+  ) => {
+    if (!readyArtwork || exportAction) return
+    setExportError("")
+    setExportAction(action)
+    try {
+      await task()
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Gagal menyiapkan ID Card.")
+    } finally {
+      setExportAction(null)
+    }
+  }
 
   return createPortal(
     <div className="dialogBackdrop employeeDialogBackdrop nametagPrintBackdrop" role="presentation" onMouseDown={onClose}>
@@ -15275,7 +15504,7 @@ function EmployeeNametagDialog({ row, onClose }: { row: EmployeeDirectoryRow | n
             <div>
               <span>ID Card</span>
               <h2 id="employee-nametag-title">ID Card Karyawan</h2>
-              <p>Kartu identitas karyawan dengan barcode internal DMS.</p>
+              <p>Unduh desain atau cetak satu kartu pada posisi yang dipilih di lembar A4.</p>
             </div>
           </div>
           <button className="iconButton dialogClose" type="button" aria-label="Tutup ID Card" onClick={onClose}>
@@ -15284,48 +15513,69 @@ function EmployeeNametagDialog({ row, onClose }: { row: EmployeeDirectoryRow | n
         </div>
 
         <div className="employeeNametagBody">
-          <article className="employeeNametagCard" id="employee-nametag-print">
-            <div className="employeeNametagBrand">
-              <img src={dmsLogo} alt="" />
-              <div>
-                <span>DMS</span>
-                <strong>Employee ID</strong>
-              </div>
-              <em>Official</em>
+          {readyArtwork ? (
+            <img className="employeeNametagArtwork" src={getSvgDataUri(readyArtwork)} alt={`ID Card ${row.fullName}, ${row.employeeCode}`} />
+          ) : (
+            <div className="employeeNametagState" role={artworkError ? "alert" : "status"}>
+              <p>{artworkError || "Menyiapkan foto dan desain kartu…"}</p>
+              {artworkError && <button className="secondaryButton" type="button" onClick={() => setRetry((value) => value + 1)}>Coba lagi</button>}
             </div>
-            <div className="employeeNametagAvatar">
-              {row.photoUrl ? <img src={row.photoUrl} alt="" /> : <span>{getProfileInitials(row.fullName || row.employeeCode)}</span>}
-            </div>
-            <div className="employeeNametagIdentity">
-              <span>{row.employeeCode}</span>
-              <h3>{displayName}</h3>
-              <p>{displayPosition}</p>
-            </div>
-            <div className="employeeNametagInfoGrid">
-              <span>
-                <small>Divisi</small>
-                <strong>{displayDivision}</strong>
-              </span>
-            </div>
-            <div className="employeeNametagBarcode">
-              <Code128Barcode value={barcodeValue} className="employeeBarcodeSvg" />
-              <strong>{barcodeValue}</strong>
-            </div>
-            <div className="employeeNametagMeta">
-              <span>PROPERTY OF DMS</span>
-            </div>
-          </article>
+          )}
         </div>
 
-        <div className="masterDetailActions">
-          <button className="secondaryButton" type="button" onClick={onClose}>Tutup</button>
-          <button className="secondaryButton" type="button" onClick={() => downloadTextFile(`${safeFileName}.svg`, nametagSvg, "image/svg+xml")}>
+        <div className="masterDetailActions employeeNametagActions">
+          {(exportError || !row.photoUrl) && <p className="employeeNametagNotice" role="status">{exportError || "Karyawan belum memiliki foto. Kartu menggunakan inisial."}</p>}
+          <div className="employeeNametagPrintOptions">
+              <SelectFormField
+                label="Ukuran kartu"
+                value={printSize}
+                disabled={exportAction !== null}
+                onChange={(event) => setPrintSize(event.target.value as EmployeeIdCardPrintSize)}
+              >
+                <option value="standard">DMS · 55 × 85 mm</option>
+                <option value="pvc">PVC · 54 × 86 mm</option>
+              </SelectFormField>
+              <SelectFormField
+                label="Posisi di A4"
+                value={printPosition}
+                disabled={exportAction !== null}
+                onChange={(event) => setPrintPosition(event.target.value as EmployeeIdCardPrintPosition)}
+              >
+                <option value="top-left">Kiri atas</option>
+                <option value="center">Tengah halaman</option>
+                <option value="top-right">Kanan atas</option>
+              </SelectFormField>
+          </div>
+          <button
+            className="secondaryButton"
+            type="button"
+            disabled={exportAction !== null || !readyArtwork}
+            onClick={() => void runExport("svg", async () => {
+              downloadTextFile(`${safeFileName}.svg`, readyArtwork, "image/svg+xml")
+            })}
+          >
             <Download size={16} />
-            Download SVG
+            {exportAction === "svg" ? "Menyiapkan..." : "Download SVG"}
           </button>
-          <button className="primaryButton" type="button" onClick={() => window.print()}>
+          <button
+            className="secondaryButton"
+            type="button"
+            disabled={exportAction !== null || !readyArtwork}
+            onClick={() => void runExport("png", async () => {
+              downloadBlobFile(`${safeFileName}.png`, await createEmployeeIdCardPng(readyArtwork, printSize))
+            })}
+          >
+            <Download size={16} />
+            {exportAction === "png" ? "Menyiapkan..." : "Download PNG"}
+          </button>
+          <button
+            className="primaryButton"
+            type="button"
+            disabled={exportAction !== null || !readyArtwork}
+            onClick={() => void runExport("print", () => printEmployeeIdCard(readyArtwork, printSize, printPosition))}
+          >
             <Printer size={16} />
-            Cetak ID Card
+            {exportAction === "print" ? "Menyiapkan..." : "Cetak di A4"}
           </button>
         </div>
       </section>
