@@ -11,6 +11,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
+    "test:payroll-loading": "node --test scripts/payroll-loading.test.mjs",
     "android:init": "capacitor add android",
     "android:sync": "npm run build && capacitor sync android",
     "android:open": "capacitor open android",

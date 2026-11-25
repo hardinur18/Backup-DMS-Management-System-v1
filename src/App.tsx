@@ -80,6 +80,7 @@ import {
   OperationalTableCard,
 } from "./components/operational-page"
 import { isSupabaseConfigured, supabase, supabaseConfigError } from "./lib/supabase"
+import { fetchRowsById, payrollOvertimeFilter, sortLoadedOvertimeRows, type IdPageQuery, type PayrollSectionErrors } from "./lib/payroll-loading"
 
 type ViewId =
   | "dashboard"
@@ -619,6 +620,7 @@ interface WeeklyBonusPolicySubmitPayload {
 }
 
 interface OperationsFoundationData {
+  payrollLoadErrors?: PayrollSectionErrors
   rows: AttendanceMonitorRow[]
   allRows: AttendanceMonitorRow[]
   locations: FieldLocationSummary[]
@@ -8299,19 +8301,17 @@ const overtimeRequestPaymentColumns = `${overtimeRequestBaseColumns}, overtime_p
 const overtimeRequestTimingColumns = `${overtimeRequestPaymentColumns}, overtime_segment, actual_check_in_at, pre_shift_minutes, post_shift_minutes`
 
 async function fetchOvertimeRequestRows(startDate: string, endDate: string, dateScoped = true) {
-  const runQuery = (columns: string) => fetchSupabaseRangeRows<Record<string, unknown>>(() => {
+  const runQuery = async (columns: string) => sortLoadedOvertimeRows(await fetchRowsById<Record<string, unknown> & { id: unknown }>(() => {
     const query = supabase
       .from("overtime_requests")
       .select(columns)
 
     const scopedQuery = dateScoped
       ? query.gte("overtime_date", startDate).lte("overtime_date", endDate)
-      : query
+      : query.or(payrollOvertimeFilter(startDate, endDate))
 
-    return scopedQuery
-      .order("overtime_date", { ascending: false })
-      .order("created_at", { ascending: false }) as unknown as SupabaseRangeQuery<Record<string, unknown>>
-  }, 500, 10000)
+    return scopedQuery as unknown as IdPageQuery<Record<string, unknown> & { id: unknown }>
+  }))
 
   try {
     const rows = await runQuery(overtimeRequestTimingColumns)
@@ -8993,6 +8993,8 @@ async function loadOperationsFoundationData(targetDate = getLocalDateKey(), opti
   const loadScope: AttendanceLoadScope = options.scope || "full"
   const recapOnly = loadScope === "attendance-recap"
   const emptyResult = Promise.resolve({ data: [], error: null })
+  const partialPayrollLoad = options.includeAllPayrollCycles === true
+  const payrollLoadErrors: PayrollSectionErrors = {}
 
   if (options.refreshBackend) {
     const backendRange = getAttendanceBackendRefreshRange(startDate, endDate)
@@ -9020,7 +9022,10 @@ async function loadOperationsFoundationData(targetDate = getLocalDateKey(), opti
 
   if (options.refreshPayroll || options.refreshWeeklyBonus) {
     const weeklyBonusRefresh = await supabase.rpc("refresh_weekly_shift_bonus_cycles")
-    if (weeklyBonusRefresh.error && !isMissingWeeklyBonusSchema(weeklyBonusRefresh.error)) throw weeklyBonusRefresh.error
+    if (weeklyBonusRefresh.error && !isMissingWeeklyBonusSchema(weeklyBonusRefresh.error)) {
+      if (!partialPayrollLoad) throw weeklyBonusRefresh.error
+      payrollLoadErrors.bonus = getFriendlySupabaseError(weeklyBonusRefresh.error, "Bonus belum berhasil diperbarui. Klik Refresh Data untuk mencoba lagi.")
+    }
   }
 
   const attendanceLogColumns = "id, employee_id, work_location_id, attendance_date, event_type, event_at, latitude, longitude, distance_m, radius_m, gps_status, face_status, face_score, face_snapshot_path, status, workday_counted, source, attendance_media, attendance_device_id, biofinger_event_id, notes"
@@ -9087,7 +9092,15 @@ async function loadOperationsFoundationData(targetDate = getLocalDateKey(), opti
   const weeklyBonusError = weeklyBonusResult.error && !isMissingWeeklyBonusSchema(weeklyBonusResult.error) ? weeklyBonusResult.error : null
   const weeklyBonusPaymentError = weeklyBonusPaymentResult.error && !isMissingWeeklyBonusSchema(weeklyBonusPaymentResult.error) ? weeklyBonusPaymentResult.error : null
   const weeklyBonusPolicyError = weeklyBonusPolicyResult.error && !isMissingWeeklyBonusSchema(weeklyBonusPolicyResult.error) ? weeklyBonusPolicyResult.error : null
-  const error = employeeResult.error || divisionResult.error || positionResult.error || locationResult.error || shiftResult.error || reviewAttendanceResult.error || overtimeResult.error || payrollComponentResult.error || appUserResult.error || faceProfileResult.error || leaveResult.error || payrollPaymentError || overtimePaymentError || weeklyBonusError || weeklyBonusPaymentError || weeklyBonusPolicyError
+  if (partialPayrollLoad) {
+    if (overtimeResult.error) payrollLoadErrors.overtime = getFriendlySupabaseError(overtimeResult.error, "Data lembur gagal dimuat.")
+    if (weeklyBonusError) payrollLoadErrors.bonus = getFriendlySupabaseError(weeklyBonusError, "Data bonus gagal dimuat.")
+    if (weeklyBonusPolicyError) payrollLoadErrors.bonusPolicy = getFriendlySupabaseError(weeklyBonusPolicyError, "Pengaturan bonus gagal dimuat.")
+    const historyError = payrollPaymentError || overtimePaymentError || weeklyBonusPaymentError
+    if (historyError) payrollLoadErrors.history = getFriendlySupabaseError(historyError, "Riwayat pembayaran belum lengkap.")
+  }
+  const error = employeeResult.error || divisionResult.error || positionResult.error || locationResult.error || shiftResult.error || reviewAttendanceResult.error || payrollComponentResult.error || appUserResult.error || faceProfileResult.error || leaveResult.error
+    || (!partialPayrollLoad && (overtimeResult.error || payrollPaymentError || overtimePaymentError || weeklyBonusError || weeklyBonusPaymentError || weeklyBonusPolicyError))
 
   if (error) throw error
 
@@ -9594,7 +9607,7 @@ async function loadOperationsFoundationData(targetDate = getLocalDateKey(), opti
     }
   })
 
-  return { rows, allRows, locations, fieldReadiness, reviews: reviewRows, overtime: overtimeReviewRows, leaveRequests, payrollPayments, overtimePayments, weeklyBonuses, weeklyBonusPayments, weeklyBonusPolicies, shifts: shiftOptions }
+  return { rows, allRows, locations, fieldReadiness, reviews: reviewRows, overtime: overtimeReviewRows, leaveRequests, payrollPayments, overtimePayments, weeklyBonuses, weeklyBonusPayments, weeklyBonusPolicies, shifts: shiftOptions, payrollLoadErrors }
 }
 
 function getBrowserPosition(): Promise<GeolocationPosition> {
@@ -20215,7 +20228,7 @@ function AttendanceCyclePage({ activeView, profile }: { activeView: "attendance-
               </button>
             )}
             {(activeView === "payroll" || (activeView === "attendance-review" && activeApprovalTab === "overtime" && canReviewOvertime)) && (
-              <button className="primaryButton" type="button" onClick={() => setOvertimeRequestOpen(true)}>
+              <button className="primaryButton" type="button" disabled={loading || Boolean(errorMessage) || (activeView === "payroll" && Boolean(data.payrollLoadErrors?.overtime))} onClick={() => setOvertimeRequestOpen(true)}>
                 <ClipboardList size={17} />
                 Request Lembur
               </button>
@@ -20235,7 +20248,9 @@ function AttendanceCyclePage({ activeView, profile }: { activeView: "attendance-
           </>
         }
         meta={
-          <InlinePageStats items={pageMetaItems} />
+          <InlinePageStats items={activeView === "payroll" && (loading || errorMessage)
+            ? [loading ? "Memuat data payroll…" : "Data payroll belum berhasil dimuat. Klik Refresh Data untuk mencoba lagi."]
+            : pageMetaItems} />
         }
       />
 
@@ -20382,6 +20397,7 @@ function AttendanceCyclePage({ activeView, profile }: { activeView: "attendance-
         </>
       ) : activeView === "payroll" ? (
         <PayrollPreviewTable
+          sectionErrors={data.payrollLoadErrors}
           rows={payrollProcessRows}
           payments={filteredPayrollPayments}
           overtimeRows={payrollOvertimeRows}
@@ -23023,6 +23039,7 @@ function WeeklyBonusPolicyDialog({
 }
 
 function PayrollPreviewTable({
+  sectionErrors = {},
   rows,
   payments,
   overtimeRows,
@@ -23043,6 +23060,7 @@ function PayrollPreviewTable({
   onVoidWeeklyBonusPayment,
   onOpenWeeklyBonusSettings,
 }: {
+  sectionErrors?: PayrollSectionErrors
   rows: AttendanceMonitorRow[]
   payments: PayrollPaymentRow[]
   overtimeRows: OvertimeReviewRow[]
@@ -23064,6 +23082,11 @@ function PayrollPreviewTable({
   onOpenWeeklyBonusSettings: () => void
 }) {
   const [workspaceTab, setWorkspaceTab] = useState<PayrollWorkspaceTab>("cycle")
+  const overtimeError = errorMessage || sectionErrors.overtime || ""
+  const bonusError = errorMessage || sectionErrors.bonus || ""
+  const historyError = errorMessage || sectionErrors.history || ""
+  const policyError = errorMessage || sectionErrors.bonusPolicy || ""
+  const incomplete = Boolean(errorMessage || Object.keys(sectionErrors).length)
   const [cycleTab, setCycleTab] = useState<PayrollCycleTab>("ready")
   const [detailRow, setDetailRow] = useState<AttendanceMonitorRow | null>(null)
   const [payslipRow, setPayslipRow] = useState<AttendanceMonitorRow | null>(null)
@@ -23148,15 +23171,15 @@ function PayrollPreviewTable({
     () => weeklyBonusPolicies.find((policy) => policy.isActive && policy.status === "active") || weeklyBonusPolicies[0] || null,
     [weeklyBonusPolicies],
   )
-  const weeklyBonusPolicyMeta = activeWeeklyBonusPolicy
+  const weeklyBonusPolicyMeta = policyError ? "Pengaturan bonus belum dimuat" : activeWeeklyBonusPolicy
     ? `${formatCurrency(activeWeeklyBonusPolicy.fullAmount)} / ${activeWeeklyBonusPolicy.targetDays || 0} hari`
     : "Belum ada policy bonus"
   const workspaceTabs = useMemo(() => ([
-    { id: "cycle" as const, label: "Gaji 26 Hari", icon: WalletCards, count: payableRows.length },
-    { id: "overtime" as const, label: "Bayar Lembur", icon: BadgeDollarSign, count: overtimePayableRows.length },
-    { id: "bonus" as const, label: "Bayar Bonus", icon: BadgeDollarSign, count: weeklyBonusPayableRows.length },
-    { id: "history" as const, label: "Riwayat Bayar", icon: FileCheck2, count: filteredUnifiedPaymentRows.length },
-  ]), [filteredUnifiedPaymentRows.length, overtimePayableRows.length, payableRows.length, weeklyBonusPayableRows.length])
+    { id: "cycle" as const, label: "Gaji 26 Hari", icon: WalletCards, count: loading || errorMessage ? "—" : payableRows.length },
+    { id: "overtime" as const, label: "Bayar Lembur", icon: BadgeDollarSign, count: loading || overtimeError ? "—" : overtimePayableRows.length },
+    { id: "bonus" as const, label: "Bayar Bonus", icon: BadgeDollarSign, count: loading || bonusError ? "—" : weeklyBonusPayableRows.length },
+    { id: "history" as const, label: "Riwayat Bayar", icon: FileCheck2, count: loading || historyError ? "—" : filteredUnifiedPaymentRows.length },
+  ]), [loading, errorMessage, overtimeError, bonusError, historyError, filteredUnifiedPaymentRows.length, overtimePayableRows.length, payableRows.length, weeklyBonusPayableRows.length])
   const payrollCycleTabs = useMemo(() => ([
     { id: "ready" as const, label: "Siap Dicek", icon: WalletCards, count: readyRows.length },
     { id: "locked" as const, label: "Menunggu Bayar", icon: Lock, count: lockedRows.length },
@@ -23190,27 +23213,34 @@ function PayrollPreviewTable({
           <div>
             <h2>Proses Payroll</h2>
             <p>Gaji 26 hari tetap berjalan. Lembur bisa ikut gaji atau dibayar terpisah mingguan/custom.</p>
-            <InlinePageStats items={[`${formatCurrency(overtimeTotal)} lembur disetujui total`, `${formatCurrency(payableAmount)} gaji siap/final`, `${formatCurrency(overtimePayableAmount)} lembur terpisah belum dibayar`, `${formatCurrency(weeklyBonusPayableAmount)} bonus belum dibayar`, weeklyBonusPolicyMeta, `${formatNumber(unifiedPaymentRows.length)} riwayat bayar`]} />
+            <InlinePageStats items={loading ? ["Memuat ringkasan payroll…"] : [
+              overtimeError ? "Lembur belum berhasil dimuat" : `${formatCurrency(overtimeTotal)} lembur disetujui total`,
+              errorMessage ? "Gaji belum berhasil dimuat" : `${formatCurrency(payableAmount)} gaji siap/final`,
+              overtimeError ? null : `${formatCurrency(overtimePayableAmount)} lembur terpisah belum dibayar`,
+              bonusError ? "Bonus belum berhasil dimuat" : `${formatCurrency(weeklyBonusPayableAmount)} bonus belum dibayar`,
+              weeklyBonusPolicyMeta,
+              historyError ? "Riwayat bayar belum lengkap" : `${formatNumber(unifiedPaymentRows.length)} riwayat bayar`,
+            ].filter(Boolean)} />
           </div>
           <div className="payrollTableActions">
-            <button className="payrollIconButton" type="button" onClick={onOpenWeeklyBonusSettings} disabled={loading} aria-label="Pengaturan bonus" title="Pengaturan bonus">
+            <button className="payrollIconButton" type="button" onClick={onOpenWeeklyBonusSettings} disabled={loading || Boolean(policyError)} aria-label="Pengaturan bonus" title="Pengaturan bonus">
               <Settings size={18} />
             </button>
             <span className="payrollExportMenu">
               <RowActionMenu label="Export payroll">
-                <RowActionMenuItem disabled={loading || workspaceTab !== "cycle" || visibleCycleRows.length === 0} onClick={() => exportPayrollCsv(visibleCycleRows)}>
+                <RowActionMenuItem disabled={loading || Boolean(errorMessage) || workspaceTab !== "cycle" || visibleCycleRows.length === 0} onClick={() => exportPayrollCsv(visibleCycleRows)}>
                   <FileBarChart size={15} />
                   Export Gaji
                 </RowActionMenuItem>
-                <RowActionMenuItem disabled={loading || workspaceTab !== "overtime" || overtimePayableRows.length === 0} onClick={() => exportPayrollOvertimeCsv(overtimePayableRows)}>
+                <RowActionMenuItem disabled={loading || Boolean(overtimeError) || workspaceTab !== "overtime" || overtimePayableRows.length === 0} onClick={() => exportPayrollOvertimeCsv(overtimePayableRows)}>
                   <Download size={15} />
                   Export Lembur
                 </RowActionMenuItem>
-                <RowActionMenuItem disabled={loading || workspaceTab !== "bonus" || weeklyBonusPayableRows.length === 0} onClick={() => exportPayrollWeeklyBonusCsv(weeklyBonusPayableRows)}>
+                <RowActionMenuItem disabled={loading || Boolean(bonusError) || workspaceTab !== "bonus" || weeklyBonusPayableRows.length === 0} onClick={() => exportPayrollWeeklyBonusCsv(weeklyBonusPayableRows)}>
                   <Download size={15} />
                   Export Bonus
                 </RowActionMenuItem>
-                <RowActionMenuItem disabled={loading || filteredUnifiedPaymentRows.length === 0} onClick={() => exportPayrollUnifiedPaymentCsv(filteredUnifiedPaymentRows)}>
+                <RowActionMenuItem disabled={loading || Boolean(historyError) || filteredUnifiedPaymentRows.length === 0} onClick={() => exportPayrollUnifiedPaymentCsv(filteredUnifiedPaymentRows)}>
                   <Download size={15} />
                   Export Riwayat
                 </RowActionMenuItem>
@@ -23220,12 +23250,23 @@ function PayrollPreviewTable({
         </div>
 
         <div className="payrollFinanceSummary">
-          <PayrollFinanceMetric icon={WalletCards} label="Gaji perlu diproses" value={formatCurrency(payableAmount)} meta={`${formatNumber(payableRows.length)} gaji siap diproses`} tone="info" />
-          <PayrollFinanceMetric icon={BadgeDollarSign} label="Lembur belum dibayar" value={formatCurrency(overtimePayableAmount)} meta={`${formatNumber(overtimePayableRows.length)} request bayar terpisah`} tone="warning" />
-          <PayrollFinanceMetric icon={BadgeDollarSign} label="Bonus belum dibayar" value={formatCurrency(weeklyBonusPayableAmount)} meta={`${formatNumber(weeklyBonusPayableRows.length)} bonus shift mingguan`} tone="success" />
-          <PayrollFinanceMetric icon={FileCheck2} label="Sudah terbayar" value={formatCurrency(paidAmount)} meta={`${formatNumber(filteredUnifiedPaymentRows.length)} transaksi / ${historyRangeLabel}`} tone="success" />
-          <PayrollFinanceMetric icon={BadgeDollarSign} label="Masih berjalan" value={formatNumber(activeRows.length)} meta="masih mengikuti absensi" tone="neutral" />
+          <PayrollFinanceMetric icon={WalletCards} label="Gaji perlu diproses" value={loading || errorMessage ? "—" : formatCurrency(payableAmount)} meta={loading ? "Memuat…" : errorMessage ? "Belum berhasil dimuat" : `${formatNumber(payableRows.length)} gaji siap diproses`} tone="info" />
+          <PayrollFinanceMetric icon={BadgeDollarSign} label="Lembur belum dibayar" value={loading || overtimeError ? "—" : formatCurrency(overtimePayableAmount)} meta={loading ? "Memuat…" : overtimeError ? "Belum berhasil dimuat" : `${formatNumber(overtimePayableRows.length)} request bayar terpisah`} tone="warning" />
+          <PayrollFinanceMetric icon={BadgeDollarSign} label="Bonus belum dibayar" value={loading || bonusError ? "—" : formatCurrency(weeklyBonusPayableAmount)} meta={loading ? "Memuat…" : bonusError ? "Belum berhasil dimuat" : `${formatNumber(weeklyBonusPayableRows.length)} bonus shift mingguan`} tone="success" />
+          <PayrollFinanceMetric icon={FileCheck2} label="Sudah terbayar" value={loading || historyError ? "—" : formatCurrency(paidAmount)} meta={loading ? "Memuat…" : historyError ? "Riwayat belum lengkap" : `${formatNumber(filteredUnifiedPaymentRows.length)} transaksi / ${historyRangeLabel}`} tone="success" />
+          <PayrollFinanceMetric icon={BadgeDollarSign} label="Masih berjalan" value={loading || errorMessage ? "—" : formatNumber(activeRows.length)} meta={loading ? "Memuat…" : errorMessage ? "Belum berhasil dimuat" : "masih mengikuti absensi"} tone="neutral" />
         </div>
+
+        {!loading && incomplete && (
+          <div className="inlineAlert" role="alert">
+            Sebagian data payroll belum berhasil dimuat. Angka bertanda — belum tersedia, bukan saldo nol.
+            {sectionErrors.overtime && <div>Lembur: {sectionErrors.overtime}</div>}
+            {sectionErrors.bonus && <div>Bonus: {sectionErrors.bonus}</div>}
+            {sectionErrors.history && <div>Riwayat: {sectionErrors.history}</div>}
+            {sectionErrors.bonusPolicy && <div>Pengaturan bonus: {sectionErrors.bonusPolicy}</div>}
+            <div>Klik Refresh Data untuk mencoba lagi.</div>
+          </div>
+        )}
 
         <div className="payrollTableToolbar">
           <CategoryTabs items={workspaceTabs} activeId={workspaceTab} ariaLabel="Area payroll" onChange={setWorkspaceTab} />
@@ -23234,7 +23275,7 @@ function PayrollPreviewTable({
         {workspaceTab === "cycle" && (
           <>
             <div className="payrollCycleSubtabs">
-              <CategoryTabs items={payrollCycleTabs} activeId={cycleTab} ariaLabel="Status gaji payroll" onChange={setCycleTab} />
+              <CategoryTabs items={loading || errorMessage ? payrollCycleTabs.map((tab) => ({ ...tab, count: "—" })) : payrollCycleTabs} activeId={cycleTab} ariaLabel="Status gaji payroll" onChange={setCycleTab} />
             </div>
             <div className="tableScroller uiDataTableScroller uiDataTableHasColumns payrollCycleTableScroller" {...cycleScrollProps}>
               <table>
@@ -23341,7 +23382,7 @@ function PayrollPreviewTable({
           <PayrollOvertimePaymentTable
             rows={pagedOvertimeRows}
             loading={loading}
-            errorMessage={errorMessage}
+            errorMessage={overtimeError}
             page={overtimePage}
             pageSize={overtimePageSize}
             totalRows={overtimePayableRows.length}
@@ -23359,7 +23400,7 @@ function PayrollPreviewTable({
           <PayrollWeeklyBonusTable
             rows={pagedBonusRows}
             loading={loading}
-            errorMessage={errorMessage}
+            errorMessage={bonusError}
             page={bonusPage}
             pageSize={bonusPageSize}
             totalRows={weeklyBonusPayableRows.length}
@@ -23398,18 +23439,18 @@ function PayrollPreviewTable({
                   Reset Waktu
                 </button>
               </div>
-              <div className="payrollHistoryExpenseSummary">
+              {!loading && !historyError && <div className="payrollHistoryExpenseSummary">
                 <PayrollFinanceMetric icon={CreditCard} label="Pengeluaran" value={formatCurrency(paidAmount)} meta={`${formatNumber(filteredUnifiedPaymentRows.length)} transaksi / ${historyRangeLabel}`} tone="success" />
                 <PayrollFinanceMetric icon={WalletCards} label="Gaji" value={formatCurrency(historySalaryAmount)} meta="Gaji 26 hari" tone="info" />
                 <PayrollFinanceMetric icon={BadgeDollarSign} label="Lembur" value={formatCurrency(historyOvertimeAmount)} meta="Bayar terpisah" tone="warning" />
                 <PayrollFinanceMetric icon={BadgeDollarSign} label="Bonus" value={formatCurrency(historyBonusAmount)} meta="Bonus shift" tone="success" />
                 <PayrollFinanceMetric icon={RotateCcw} label="Void" value={formatNumber(historyVoidedRows)} meta="Transaksi dibatalkan" tone="neutral" />
-              </div>
+              </div>}
             </div>
             <PayrollUnifiedPaymentHistoryTable
               rows={pagedPaymentRows}
               loading={loading}
-              errorMessage={errorMessage}
+              errorMessage={historyError}
               page={historyPage}
               pageSize={historyPageSize}
               totalRows={filteredUnifiedPaymentRows.length}
